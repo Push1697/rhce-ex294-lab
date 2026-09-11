@@ -1,0 +1,7 @@
+keys/
+disks/
+.vagrant/
+ansible/
+*.log
+*.err
+*.tmp

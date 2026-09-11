@@ -1,0 +1,9 @@
+dist/
+
+# Never commit key material. vagrant/keys/ is generated on first `up`; this is
+# a second guard because this repo is public.
+keys/
+*.pem
+*_ed25519
+*_rsa
+id_*

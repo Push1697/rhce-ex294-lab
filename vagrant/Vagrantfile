@@ -1,0 +1,220 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+#
+# Three-node RHCSA/RHCE lab on Vagrant + VirtualBox.
+# The KVM/libvirt equivalent of this file is lab-build.sh; this is the version
+# for a Windows (or macOS) host running VirtualBox.
+#
+#   vagrant up                  build all three
+#   vagrant ssh rhel01          get a shell
+#   vagrant snapshot save clean take the baseline snapshot
+#   vagrant snapshot restore clean
+#   vagrant halt / destroy
+#
+# Everything is overridable from the environment, so nothing here is a hostage
+# to my choices:
+#
+#   LAB_BOX=generic/rhel9   use real RHEL instead of AlmaLinux (needs a subscription)
+#   LAB_NET=192.168.56      host-only network prefix; VirtualBox only permits
+#                           192.168.56.0/21 unless you edit networks.conf
+#   LAB_DISK_MB=10240       size of each blank lab disk
+#   LAB_ANSIBLE_SYNC=1      also share the control node's ~/ansible with the host
+#                           so playbooks can be edited in VS Code
+
+# almalinux/9 rather than rockylinux/9: at the time of writing Rocky's
+# official box publishes metadata whose virtualbox artifact 404s.
+BOX        = ENV.fetch("LAB_BOX", "almalinux/9")
+NET        = ENV.fetch("LAB_NET", "192.168.56")
+DISK_MB    = ENV.fetch("LAB_DISK_MB", "10240").to_i
+SYNC_ANSIBLE = ENV.fetch("LAB_ANSIBLE_SYNC", "0") == "1"
+
+HERE      = File.dirname(File.expand_path(__FILE__))
+KIT_DIR   = File.expand_path("..", HERE)          # the kit root
+KEY_DIR   = File.join(HERE, "keys")
+KEY_FILE  = File.join(KEY_DIR, "lab_ed25519")
+DISK_DIR  = File.join(HERE, "disks")
+
+# --- where the extra lab disks live, and whether they are already attached ---
+# The blank disks are attached by hand rather than with `config.vm.disk`.
+# Vagrant's experimental disk support reconciles disks on every `up` and
+# `reload` by the *filename* of the medium currently attached. A
+# `vagrant snapshot restore` swaps that medium for the snapshot's differencing
+# image, whose filename is `{uuid}.vdi`, so the reconciliation cannot find
+# "rhel01-lab1", decides the disk is missing, and aborts trying to create a VDI
+# that already exists — leaving the machine powered off and `vagrant up`
+# broken until you hand-edit .vagrant/machines/*/virtualbox/disk_meta.
+#
+# Snapshots are mandatory before every break-fix drill in this project, so that
+# collision is not an edge case here; it is the normal path. Attaching the
+# disks directly costs a few lines and makes the two features coexist.
+VBOXMANAGE = ENV.fetch("VBOXMANAGE") do
+  ["C:/Program Files/Oracle/VirtualBox/VBoxManage.exe",
+   "/usr/bin/VBoxManage", "/usr/local/bin/VBoxManage"].find { |c| File.exist?(c) } ||
+    "VBoxManage"
+end
+VM_DIR = ENV.fetch("LAB_VM_DIR") do
+  out = `"#{VBOXMANAGE}" list systemproperties 2>#{File::NULL}`
+  (out[/^Default machine folder:\s*(.+)$/, 1] || "").strip
+end
+
+# Is something already attached at this SATA port? If so, leave it alone: after
+# a snapshot restore it is the differencing image, and forcing the base medium
+# back would break the snapshot chain.
+def lab_disk_attached?(vm_name, port)
+  out = `"#{VBOXMANAGE}" showvminfo #{vm_name} --machinereadable 2>#{File::NULL}`
+  return false if out.empty?
+  m = out[/^"SATA-#{port}-0"="(.*)"$/, 1]
+  !m.nil? && m != "none"
+end
+
+# name, ip, memory, cpus, blank disks, spare NIC for the nmcli lab
+NODES = [
+  { name: "rhel-control", ip: "#{NET}.10", mem: 2048, cpus: 2, disks: 0, spare_nic: false },
+  { name: "rhel01",       ip: "#{NET}.11", mem: 1536, cpus: 2, disks: 2, spare_nic: true  },
+  { name: "rhel02",       ip: "#{NET}.12", mem: 1536, cpus: 1, disks: 2, spare_nic: false },
+]
+
+# --- a lab SSH key, so the control node can reach the managed nodes -----------
+# Vagrant gives each VM its own key, which is no use for node-to-node access.
+def ensure_lab_key
+  return if File.exist?(KEY_FILE)
+  require "fileutils"
+  FileUtils.mkdir_p(KEY_DIR)
+  unless system("ssh-keygen", "-t", "ed25519", "-N", "", "-C", "rhce-lab",
+                "-f", KEY_FILE, out: File::NULL, err: File::NULL)
+    abort <<~MSG
+
+      Could not run ssh-keygen to create the lab key.
+
+      Windows ships it at C:\\Windows\\System32\\OpenSSH\\ssh-keygen.exe — if that
+      is missing, install "OpenSSH Client" from Settings > System > Optional
+      features, or create the key yourself:
+
+          ssh-keygen -t ed25519 -N "" -f "#{KEY_FILE}"
+
+    MSG
+  end
+  puts "==> lab: created a shared lab SSH key in vagrant/keys/"
+end
+ensure_lab_key
+
+LAB_PUBKEY = File.read("#{KEY_FILE}.pub").strip
+LAB_PRIVKEY = File.read(KEY_FILE)
+
+HOSTS_BLOCK = NODES.map { |n| "#{n[:ip]} #{n[:name]} #{n[:name]}.lab.local" }.join("\n")
+
+Vagrant.configure("2") do |config|
+  config.vm.box = BOX
+  config.vm.box_check_update = false
+
+  # Vagrant's own key stays in play for `vagrant ssh`; this only adds ours.
+  config.ssh.insert_key = true
+
+  # The lab kit (checkers and saboteurs) is mounted read-only, so a lab mistake
+  # inside a VM can never reach the vault copy on the host.
+  # fmode must keep the execute bit: the checkers are scripts, and a 644 share
+  # makes `sudo /opt/rhce-labs/verify` fail with "command not found".
+  config.vm.synced_folder KIT_DIR, "/opt/rhce-labs",
+                          mount_options: ["ro", "dmode=755", "fmode=755"]
+
+  NODES.each do |node|
+    config.vm.define node[:name] do |vm|
+      vm.vm.hostname = "#{node[:name]}.lab.local"
+
+      # eth1: the lab network every node talks over
+      vm.vm.network "private_network", ip: node[:ip]
+
+      # eth2 on rhel01: deliberately left unconfigured. The nmcli lab needs an
+      # interface to configure, and reconfiguring eth1 would fight Vagrant.
+      if node[:spare_nic]
+        vm.vm.network "private_network", ip: "#{NET}.31", auto_config: false
+      end
+
+      vm.vm.provider "virtualbox" do |vb|
+        vb.name = node[:name]
+        vb.memory = node[:mem]
+        vb.cpus = node[:cpus]
+        # NOT linked_clone. The AlmaLinux/RHEL boxes boot via EFI, and a
+        # VirtualBox linked clone does not inherit the EFI boot entry — the VM
+        # then hangs at the firmware splash with nothing to boot. Full clones
+        # cost about 2 GB each, which is the right trade for booting at all.
+        vb.customize ["modifyvm", :id, "--graphicscontroller", "vmsvga"]
+        vb.customize ["modifyvm", :id, "--audio-driver", "none"]
+
+        # Note on the clock: the guest additions resynchronise it from the host
+        # every few seconds, so a fault that only moves the wall clock does not
+        # survive. Turning that off (GetHostTimeDisabled) works, but VBoxService
+        # then logs "timesync Error: VbglR3GetHostTime failed" to the console
+        # every ten seconds and journald rotates on every jump — a permanent red
+        # herring on a box built for troubleshooting practice. So host sync
+        # stays on, and the clock drill uses knobs the hypervisor has no opinion
+        # about: the time service, the timezone, /etc/adjtime, and file dates.
+      end
+
+      # Blank disks for the partition, swap and LVM labs. VirtualBox presents
+      # them as /dev/sdb and /dev/sdc, where KVM would give vdb and vdc — the
+      # checkers detect this rather than assuming.
+      #
+      # Attached here rather than with `config.vm.disk` so that snapshots keep
+      # working — see the note by lab_disk_attached? above. This also means
+      # VAGRANT_EXPERIMENTAL=disks is no longer needed.
+      if node[:disks] > 0
+        vm.vm.provider "virtualbox" do |vb|
+          node[:disks].times do |i|
+            port = i + 1
+            vdi  = File.join(VM_DIR, node[:name], "#{node[:name]}-lab#{port}.vdi")
+            next if lab_disk_attached?(node[:name], port)
+            unless File.exist?(vdi)
+              vb.customize ["createmedium", "disk", "--filename", vdi,
+                            "--size", DISK_MB, "--format", "VDI"]
+            end
+            vb.customize ["storageattach", :id, "--storagectl", "SATA",
+                          "--port", port.to_s, "--device", "0",
+                          "--type", "hdd", "--medium", vdi]
+          end
+        end
+      end
+
+      if node[:name] == "rhel-control" && SYNC_ANSIBLE
+        # dmode/fmode matter: VirtualBox mounts shares 777 by default, and
+        # Ansible silently ignores an ansible.cfg in a world-writable directory.
+        vm.vm.synced_folder File.join(HERE, "ansible"), "/home/vagrant/ansible",
+                            create: true, owner: "vagrant", group: "vagrant",
+                            mount_options: ["dmode=755", "fmode=644"]
+      end
+
+      vm.vm.provision "shell",
+                      name: "common",
+                      env: { "HOSTS_BLOCK"    => HOSTS_BLOCK,
+                             "LAB_PUBKEY"     => LAB_PUBKEY,
+                             "LAB_PRIVKEY"    => LAB_PRIVKEY,
+                             "LAB_IP"         => node[:ip],
+                             "LAB_NET_PREFIX" => NET,
+                             "LAB_SPARE"      => node[:spare_nic] ? "1" : "0" },
+                      path: "provision/common.sh"
+
+      if node[:name] == "rhel-control"
+        vm.vm.provision "shell",
+                        name: "control",
+                        env: { "LAB_PRIVKEY" => LAB_PRIVKEY,
+                               "LAB_NET" => NET,
+                               "SYNC_ANSIBLE" => SYNC_ANSIBLE ? "1" : "0" },
+                        path: "provision/control.sh"
+      end
+
+      vm.vm.post_up_message = <<~MSG if node[:name] == NODES.last[:name]
+
+        Lab is up. Before you start Week 1:
+
+            vagrant ssh rhel-control -c 'sudo /opt/rhce-labs/verify env'
+            vagrant snapshot save clean
+
+        Then work the labs and grade yourself from inside a node:
+
+            vagrant ssh rhel01
+            sudo /opt/rhce-labs/verify 1.2
+
+      MSG
+    end
+  end
+end
