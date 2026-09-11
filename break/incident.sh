@@ -77,13 +77,13 @@ declare -A CAUSE=(
   [f3]="three independent causes behind one symptom: a chcon relabel, a move to an unlabelled port, and http removed from the firewall"
   [f4]="a systemd drop-in added RequiresMountsFor for a mount unit that does not exist"
   [f5]="a large file was opened by a background process and then deleted, so the space is allocated but unreachable"
-  [f6]="NTP was disabled and the clock pushed months into the future"
+  [f6]="four separate time faults: the time service disabled, the timezone moved to Pacific/Kiritimati, /etc/adjtime switched to LOCAL so a reboot shifts the clock, and files under /etc dated forty days ahead"
   [f7]="Defaults secure_path lost its sbin directories, and a sudoers.d file was made world-writable"
   [f8]="selinux=0 was added to the kernel command line, which beats /etc/selinux/config"
   [f9]="the NetworkManager profile carries a bogus DNS server, so the generated resolv.conf reverts on every boot"
   [xnfs]="the fault is on rhel02, not rhel01: nfs was removed from the server's firewall"
   [xweb]="the fault is on rhel02's side of the conversation: a rich rule there rejects rhel01"
-  [persist]="a systemd timer named sysstat-collect-aux re-applies a firewall fault every three minutes; the unit and its script both carry a lab marker, but you have to find them"
+  [persist]="a systemd timer named sysstat-collect-aux re-applies a fault every three minutes — the firewall where firewalld exists, otherwise the hosts: line in nsswitch.conf. The unit and its script both carry a lab marker, but you have to find them"
   [decoy]="a decoy. rngd was stopped and a warning logged. Nothing depended on it, and nothing in the acceptance criteria mentions it — the exercise was to not waste time on it"
 )
 
