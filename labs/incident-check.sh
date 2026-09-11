@@ -118,7 +118,8 @@ no_persistence_left() {
   [[ -e /usr/local/sbin/sysstat-collect-aux ]] && found+=("/usr/local/sbin/sysstat-collect-aux")
   systemctl is-enabled sysstat-collect-aux.timer >/dev/null 2>&1 && found+=("the timer, still enabled")
   if ((${#found[@]})); then
-    local IFS=", "; echo "still present: ${found[*]}"
+    # ${found[*]} joins on the first character of IFS only, so ", " gave "a,b"
+    echo "still present: $(printf '%s, ' "${found[@]}" | sed 's/, $//')"
     echo "a repair that lasts only until the next timer firing is not a repair"
     return 1
   fi
